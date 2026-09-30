@@ -22,9 +22,26 @@ class NotFoundError(DomainError):
 class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
+
 
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
+
+
+class ApprovalInvalidatedError(DomainError):
+    """A previously approved pairing no longer rests on valid basis.
+
+    ``details`` carries the machine-readable invalidation reason so the
+    transport/completion flow and the UI can show *why* the stale approval
+    can no longer be used.
+    """
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 class Role(str, Enum):

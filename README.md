@@ -25,6 +25,21 @@ python3 app.py --db ./data.db --port 8308
 ## 核心对象
 
 - `animal`：个体谱系；`pairing`：配对建议；`transfer`：机构和运输记录。
+- 运输记录可用 `pairing_id` 关联配对，运输流程由此与配对批准衔接：授权/发运/到达都会校验批准是否仍有效。
+
+## 协调语义
+
+- **乐观批准**：`approve` 必须带 `expected_version`。两人同时基于同一版本批准时只有一人成功，后到者收到 `409 ConflictError`，响应体 `details` 给出 `expected_version`/`current_version`。
+- **批准快照**：批准时记录双方状态、谱系字段与亲缘系数（`approval_basis`）。
+- **自动失效**：个体被隔离、标记死亡或谱系（`update_pedigree`）更新后，所有引用它且尚未执行的 `approved` 配对自动变为 `invalidated`，`data.invalidated` 保存人可读原因与代码（如 `animal_status_changed`、`pedigree_changed`、`inbreeding_exceeded`）。已完成（`completed`）的配对与运输步骤保留不动。
+- **运输/完成联动**：对失效配对执行 `complete` 或关联运输的 `authorize`/`ship`/`arrive` 返回 `422 ApprovalInvalidatedError`，`details.reason` 说明失效原因；已完成的步骤不回滚，解除原因后用 `reapprove` 重新批准即可从当前步骤继续。
+- **步骤台账与幂等重试**：配对完成、运输授权/发运/到达登记在 `process_steps`。失败后重试已完成步骤不会重复登记后代或重复占用个体（占用字段为 `animal.data.occupied_by`）。动作请求可带 `idempotency_key`（请求体或 `Idempotency-Key` 头）。
+
+### 配对/运输动作
+
+- `pairing`：`approve`（需 `sire_id`、`dam_id`，可带 `approvals`）、`reject`、`reapprove`（从 `invalidated` 恢复并刷新快照）、`complete`（`offspring_ids` 或 `offspring` 规格；后者会自动登记后代个体）。
+- `transfer`：`authorize`（`permit_id`）、`ship`（`transport_id`，占用个体）、`arrive`（`arrival_date`，释放占用）。
+- `animal`：`mark_deceased`、`quarantine_animal`、`release_quarantine`、`update_pedigree`（`sire_id`/`dam_id`，状态不变）。
 
 ## 主要接口
 

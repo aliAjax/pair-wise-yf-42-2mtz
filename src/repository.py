@@ -140,6 +140,40 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def invalidate_approved_pairings(self, animal_id, reason):
+        """Invalidate all approved pairings referencing an animal.
+
+        Returns the ids of pairings that were moved to ``invalidated``.
+        Completed pairings are left untouched so registered offspring and
+        other finished steps are preserved.
+        """
+        invalidated_at = utcnow()
+        invalidated_ids = []
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, data FROM entities "
+                "WHERE kind = 'pairing' AND status = 'approved'"
+            ).fetchall()
+            for row in rows:
+                data = json.loads(row["data"])
+                if data.get("sire_id") == animal_id or data.get("dam_id") == animal_id:
+                    data["invalidation_reason"] = reason
+                    data["invalidated_at"] = invalidated_at
+                    cursor = connection.execute(
+                        "UPDATE entities "
+                        "SET status = 'invalidated', version = version + 1, "
+                        "    data = ?, updated_at = ? "
+                        "WHERE id = ? AND status = 'approved'",
+                        (
+                            json.dumps(data, ensure_ascii=False, sort_keys=True),
+                            utcnow(),
+                            row["id"],
+                        ),
+                    )
+                    if cursor.rowcount:
+                        invalidated_ids.append(row["id"])
+        return invalidated_ids
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

@@ -6,29 +6,222 @@
   <title>动物园谱系与繁育协调</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
-    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+    main { max-width: 920px; margin: auto; }
+    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+    .card h3 { margin-top: 0; }
+    label { display: block; margin: .5rem 0 .2rem; font-size: .9rem; color: #374151; }
+    input, select { padding: .45rem; width: 100%; max-width: 360px; box-sizing: border-box; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 220px; }
+    .invalid { background: #fef2f2; border-color: #fca5a5; }
+    .ok { color: #047857; }
+    .err { color: #b91c1c; }
+    .muted { color: #6b7280; font-size: .85rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #e5e7eb; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>动物园谱系与繁育协调</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
+  <p>配对批准与个体运输在此衔接：动物状态或谱系更新后，未执行的批准自动失效；运输失败可从已完成步骤重试。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+
+  <div class="card">
+    <h3>查询实体 / 查看失效原因</h3>
+    <div class="row">
+      <div><label>实体 ID</label><input id="q-id" placeholder="例如 pairing-..."></div>
+    </div>
+    <p><button onclick="queryEntity()">查询</button> <button onclick="listPairings()">列出所有配对</button></p>
+    <div id="q-view"></div>
+  </div>
+
+  <div class="card">
+    <h3>提交配对批准</h3>
+    <div class="row">
+      <div><label>配对 ID</label><input id="ap-pairing" placeholder="pairing id"></div>
+      <div><label>父本 ID (sire_id)</label><input id="ap-sire" placeholder="animal id"></div>
+      <div><label>母本 ID (dam_id)</label><input id="ap-dam" placeholder="animal id"></div>
+    </div>
+    <div class="row">
+      <div><label>批准人 (approvals，逗号分隔)</label><input id="ap-approvals" value="vet-1"></div>
+      <div><label>期望版本 (expected_version)</label><input id="ap-version" type="number" value="1"></div>
+    </div>
+    <p class="muted">两人同时提交时，后到者会看到版本冲突 (409 ConflictError)。</p>
+    <p><button onclick="submitApproval()">提交批准</button></p>
+    <div id="ap-view"></div>
+  </div>
+
+  <div class="card">
+    <h3>动物状态 / 谱系更新</h3>
+    <div class="row">
+      <div><label>动物 ID</label><input id="an-id"></div>
+      <div><label>动作</label>
+        <select id="an-action" onchange="animalFields()">
+          <option value="quarantine_animal">quarantine_animal (隔离)</option>
+          <option value="release_quarantine">release_quarantine (解除隔离)</option>
+          <option value="mark_deceased">mark_deceased (标记死亡)</option>
+          <option value="update_pedigree">update_pedigree (更新谱系)</option>
+        </select>
+      </div>
+      <div><label>期望版本</label><input id="an-version" type="number" value="1"></div>
+    </div>
+    <div id="an-extra"></div>
+    <p class="muted">更新后，引用该动物且未完成的批准会自动失效并记录原因。</p>
+    <p><button onclick="submitAnimal()">提交更新</button></p>
+    <div id="an-view"></div>
+  </div>
+
+  <div class="card">
+    <h3>运输记录：从已完成步骤重试</h3>
+    <div class="row">
+      <div><label>运输 ID</label><input id="tr-id"></div>
+      <div><label>动作</label>
+        <select id="tr-action" onchange="transportFields()">
+          <option value="authorize">authorize (批准)</option>
+          <option value="ship">ship (发运)</option>
+          <option value="arrive">arrive (到达)</option>
+        </select>
+      </div>
+      <div><label>期望版本</label><input id="tr-version" type="number" value="1"></div>
+    </div>
+    <div id="tr-extra"></div>
+    <div class="row">
+      <div><label><input type="checkbox" id="tr-fail" style="width:auto"> 模拟本次运输失败 (simulate_failure)</label></div>
+    </div>
+    <p class="muted">失败后状态停留在上一步；重试从已完成步骤继续，重复重试不会重复登记后代或占用。</p>
+    <p><button onclick="submitTransport()">提交运输动作</button></p>
+    <div id="tr-view"></div>
+  </div>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+function show(id, html) { document.getElementById(id).innerHTML = html; }
+function fmt(obj) { return JSON.stringify(obj, null, 2); }
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  return { status: res.status, body };
 }
+
+function headers() {
+  return { "Content-Type": "application/json", "X-User-Id": "demo", "X-Role": "admin" };
+}
+
+async function checkHealth() {
+  const { body } = await api('/health');
+  show('result', fmt(body));
+}
+
+function invalidationHtml(entity) {
+  const d = entity.data || {};
+  if (entity.status === 'invalidated') {
+    return '<p class="err">该批准已失效：' + (d.invalidation_reason || '未知原因') + '</p>';
+  }
+  if (entity.status === 'completed') {
+    return '<p class="ok">已完成，后代已登记：' + fmt(d.offspring_ids || []) + '</p>';
+  }
+  return '<p class="muted">状态：' + entity.status + '（版本 ' + entity.version + '）</p>';
+}
+
+async function queryEntity() {
+  const id = document.getElementById('q-id').value.trim();
+  if (!id) return;
+  const { status, body } = await api('/api/entities/' + encodeURIComponent(id));
+  if (status !== 200) { show('q-view', '<p class="err">' + (body.error || status) + '</p>'); return; }
+  show('q-view', invalidationHtml(body) + '<pre>' + fmt(body) + '</pre>');
+}
+
+async function listPairings() {
+  const { body } = await api('/api/pairings');
+  const items = body.items || [];
+  if (!items.length) { show('q-view', '<p class="muted">没有配对记录</p>'); return; }
+  let rows = items.map(p => {
+    const reason = (p.data && p.data.invalidation_reason) ? p.data.invalidation_reason : '';
+    const cls = p.status === 'invalidated' ? 'err' : (p.status === 'completed' ? 'ok' : '');
+    return '<tr><td>' + p.id + '</td><td class="' + cls + '">' + p.status + '</td><td>' + p.version + '</td><td>' + reason + '</td></tr>';
+  });
+  show('q-view', '<table><tr><th>配对 ID</th><th>状态</th><th>版本</th><th>失效原因</th></tr>' + rows.join('') + '</table>');
+}
+
+async function submitApproval() {
+  const pairing = document.getElementById('ap-pairing').value.trim();
+  const sire = document.getElementById('ap-sire').value.trim();
+  const dam = document.getElementById('ap-dam').value.trim();
+  const approvals = document.getElementById('ap-approvals').value.split(',').map(s => s.trim()).filter(Boolean);
+  const version = parseInt(document.getElementById('ap-version').value, 10);
+  const { status, body } = await api('/api/entities/' + encodeURIComponent(pairing) + '/actions', {
+    method: 'POST', headers: headers(),
+    body: JSON.stringify({ action: 'approve', data: { sire_id: sire, dam_id: dam, approvals }, expected_version: version })
+  });
+  if (status === 200) {
+    show('ap-view', '<p class="ok">批准成功，状态：' + body.status + '，版本：' + body.version + '</p>');
+  } else {
+    show('ap-view', '<p class="err">批准失败 (' + status + ')：' + (body.error || '') + '</p><pre>' + fmt(body) + '</pre>');
+  }
+}
+
+function animalFields() {
+  const action = document.getElementById('an-action').value;
+  let html = '';
+  if (action === 'quarantine_animal') html = '<div class="row"><div><label>原因 reason</label><input id="an-reason"></div></div>';
+  else if (action === 'mark_deceased') html = '<div class="row"><div><label>原因 cause</label><input id="an-cause"></div></div>';
+  else if (action === 'update_pedigree') html = '<div class="row"><div><label>新父本 sire_id（可空）</label><input id="an-sire"></div><div><label>新母本 dam_id（可空）</label><input id="an-dam"></div></div>';
+  show('an-extra', html);
+}
+
+async function submitAnimal() {
+  const id = document.getElementById('an-id').value.trim();
+  const action = document.getElementById('an-action').value;
+  const version = parseInt(document.getElementById('an-version').value, 10);
+  const data = {};
+  if (action === 'quarantine_animal') data.reason = document.getElementById('an-reason').value;
+  else if (action === 'mark_deceased') data.cause = document.getElementById('an-cause').value;
+  else if (action === 'update_pedigree') {
+    const s = document.getElementById('an-sire').value.trim();
+    const d = document.getElementById('an-dam').value.trim();
+    if (s) data.sire_id = s;
+    if (d) data.dam_id = d;
+  }
+  const { status, body } = await api('/api/entities/' + encodeURIComponent(id) + '/actions', {
+    method: 'POST', headers: headers(),
+    body: JSON.stringify({ action, data, expected_version: version })
+  });
+  if (status === 200) show('an-view', '<p class="ok">已更新，状态：' + body.status + '，版本：' + body.version + '</p>');
+  else show('an-view', '<p class="err">失败 (' + status + ')：' + (body.error || '') + '</p>');
+}
+
+function transportFields() {
+  const action = document.getElementById('tr-action').value;
+  let html = '';
+  if (action === 'authorize') html = '<div class="row"><div><label>许可号 permit_id</label><input id="tr-permit"></div></div>';
+  else if (action === 'ship') html = '<div class="row"><div><label>运输号 transport_id</label><input id="tr-transport"></div></div>';
+  else if (action === 'arrive') html = '<div class="row"><div><label>到达日期 arrival_date</label><input id="tr-arrival" placeholder="2026-05-01"></div></div>';
+  show('tr-extra', html);
+}
+
+async function submitTransport() {
+  const id = document.getElementById('tr-id').value.trim();
+  const action = document.getElementById('tr-action').value;
+  const version = parseInt(document.getElementById('tr-version').value, 10);
+  const fail = document.getElementById('tr-fail').checked;
+  const data = {};
+  if (action === 'authorize') data.permit_id = document.getElementById('tr-permit').value;
+  else if (action === 'ship') { data.transport_id = document.getElementById('tr-transport').value; if (fail) data.simulate_failure = true; }
+  else if (action === 'arrive') data.arrival_date = document.getElementById('tr-arrival').value;
+  const { status, body } = await api('/api/entities/' + encodeURIComponent(id) + '/actions', {
+    method: 'POST', headers: headers(),
+    body: JSON.stringify({ action, data, expected_version: version })
+  });
+  if (status === 200) show('tr-view', '<p class="ok">完成，状态：' + body.status + '，版本：' + body.version + (body.data && body.data.occupied ? '，已占用' : '') + '</p>');
+  else show('tr-view', '<p class="err">失败 (' + status + ')：' + (body.error || '') + '</p>');
+}
+
+animalFields();
+transportFields();
 </script>
 </body>
 </html>

@@ -27,6 +27,14 @@ def inbreeding_coefficient(sire, dam):
     return 0.0
 
 
+def _animal_snapshot(animal):
+    return {
+        "status": animal["status"],
+        "sire_id": animal["data"].get("sire_id"),
+        "dam_id": animal["data"].get("dam_id"),
+    }
+
+
 def _validate_pairing(actor, entity, data, lookup):
     sire = _find_one(lookup, "animal", "id", data.get("sire_id"))
     dam = _find_one(lookup, "animal", "id", data.get("dam_id"))
@@ -34,23 +42,57 @@ def _validate_pairing(actor, entity, data, lookup):
         raise ValidationError("pairing requires two existing animals")
     if sire["status"] != "active" or dam["status"] != "active":
         raise ValidationError("pairing animals must be active")
-    if inbreeding_coefficient(sire["data"], dam["data"]) > 0.125:
+    coeff = inbreeding_coefficient(sire["data"], dam["data"])
+    if coeff > 0.125:
         raise ValidationError("pairing exceeds inbreeding threshold")
-    return {"approved_by": actor.user_id}
+    return {
+        "approved_by": actor.user_id,
+        "inbreeding_coefficient": coeff,
+        "sire_snapshot": _animal_snapshot(sire),
+        "dam_snapshot": _animal_snapshot(dam),
+    }
+
+
+def _validate_transfer(actor, entity, data, lookup):
+    animal_id = entity["data"].get("animal_id") or data.get("animal_id")
+    animal = _find_one(lookup, "animal", "id", animal_id)
+    if not animal:
+        raise ValidationError("transfer requires an existing animal")
+    if animal["status"] != "active":
+        raise ValidationError(
+            "transfer animal must be active (currently %s)" % animal["status"])
+    pairing_id = entity["data"].get("pairing_id") or data.get("pairing_id")
+    if pairing_id:
+        pairing = _find_one(lookup, "pairing", "id", pairing_id)
+        if pairing and pairing["status"] == "invalidated":
+            reason = pairing["data"].get("invalidation_reason", "approval invalidated")
+            raise ValidationError("pairing approval invalidated: " + str(reason))
+    return {}
+
+
+def _validate_ship(actor, entity, data, lookup):
+    _validate_transfer(actor, entity, data, lookup)
+    # Shipping occupies the animal/resource; recorded once and never
+    # re-applied on retries.
+    return {"occupied": True}
 
 
 CUSTOM_CREATE = {'animal': _validate_animal}
-CUSTOM_TRANSITIONS = {('pairing', 'approve'): _validate_pairing}
+CUSTOM_TRANSITIONS = {
+    ('pairing', 'approve'): _validate_pairing,
+    ('transfer', 'authorize'): _validate_transfer,
+    ('transfer', 'ship'): _validate_ship,
+}
 
 
 class RuleEngine:
     ALIASES = {'animals': 'animal', 'pairings': 'pairing', 'transfers': 'transfer'}
     INITIAL_STATUS = {'animal': 'active', 'pairing': 'proposed', 'transfer': 'planned'}
-    TRANSITIONS = {'animal': {'mark_deceased': (('active',), 'deceased'), 'quarantine_animal': (('active',), 'quarantined'), 'release_quarantine': (('quarantined',), 'active')}, 'pairing': {'approve': (('proposed',), 'approved'), 'reject': (('proposed',), 'rejected'), 'complete': (('approved',), 'completed')}, 'transfer': {'authorize': (('planned',), 'authorized'), 'ship': (('authorized',), 'in_transit'), 'arrive': (('in_transit',), 'completed')}}
+    TRANSITIONS = {'animal': {'mark_deceased': (('active',), 'deceased'), 'quarantine_animal': (('active',), 'quarantined'), 'release_quarantine': (('quarantined',), 'active'), 'update_pedigree': (('active',), 'active')}, 'pairing': {'approve': (('proposed',), 'approved'), 'reject': (('proposed',), 'rejected'), 'complete': (('approved',), 'completed')}, 'transfer': {'authorize': (('planned',), 'authorized'), 'ship': (('authorized',), 'in_transit'), 'arrive': (('in_transit',), 'completed')}}
     CREATE_REQUIRED = {'animal': ('name', 'sex'), 'pairing': ('proposed_by',), 'transfer': ('animal_id', 'from_institution', 'to_institution')}
     ACTION_REQUIRED = {('animal', 'mark_deceased'): ('cause',), ('animal', 'quarantine_animal'): ('reason',), ('pairing', 'approve'): ('sire_id', 'dam_id', 'approvals'), ('pairing', 'reject'): ('reason',), ('pairing', 'complete'): ('offspring_ids',), ('transfer', 'authorize'): ('permit_id',), ('transfer', 'ship'): ('transport_id',), ('transfer', 'arrive'): ('arrival_date',)}
     CREATE_ROLES = {'animal': ('admin', 'registrar'), 'pairing': ('admin', 'coordinator'), 'transfer': ('admin', 'registrar')}
-    ROLE_ACTIONS = {'mark_deceased': ('admin', 'veterinarian'), 'quarantine_animal': ('admin', 'veterinarian'), 'release_quarantine': ('admin', 'veterinarian'), 'approve': ('admin', 'coordinator'), 'reject': ('admin', 'coordinator'), 'complete': ('admin', 'coordinator'), 'authorize': ('admin', 'registrar'), 'ship': ('admin', 'registrar'), 'arrive': ('admin', 'registrar')}
+    ROLE_ACTIONS = {'mark_deceased': ('admin', 'veterinarian'), 'quarantine_animal': ('admin', 'veterinarian'), 'release_quarantine': ('admin', 'veterinarian'), 'update_pedigree': ('admin', 'registrar'), 'approve': ('admin', 'coordinator'), 'reject': ('admin', 'coordinator'), 'complete': ('admin', 'coordinator'), 'authorize': ('admin', 'registrar'), 'ship': ('admin', 'registrar'), 'arrive': ('admin', 'registrar')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -72,6 +114,32 @@ class RuleEngine:
             value = data.get(field)
             if value is None or value == "" or value == [] or value == {}:
                 raise ValidationError("missing required field: " + field)
+
+    # Actions that may be safely re-run from the completed step: re-executing
+    # them is a no-op success so side effects (offspring registration,
+    # occupation) are never duplicated. Approval is intentionally excluded so
+    # two concurrent approvals cannot both succeed.
+    IDEMPOTENT_ACTIONS = {
+        ('pairing', 'complete'),
+        ('transfer', 'authorize'),
+        ('transfer', 'ship'),
+        ('transfer', 'arrive'),
+    }
+
+    def _allowed_roles(self, kind, action):
+        return self.ROLE_ACTIONS.get(
+            (kind, action), self.ROLE_ACTIONS.get(action, ("admin",))
+        )
+
+    def is_idempotent(self, entity, action):
+        kind = self.normalize_kind(entity["kind"])
+        if (kind, action) not in self.IDEMPOTENT_ACTIONS:
+            return False
+        transition = self.TRANSITIONS.get(kind, {}).get(action)
+        if not transition:
+            return False
+        _, next_status = transition
+        return entity["status"] == next_status
 
     def validate_create(self, actor, kind, data, lookup=None):
         kind = self.normalize_kind(kind)
